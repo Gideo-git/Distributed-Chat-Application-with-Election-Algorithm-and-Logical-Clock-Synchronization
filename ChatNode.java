@@ -1,21 +1,13 @@
-// ChatNode.java - Interface for chat node operations
-import java.rmi.Remote;
 import java.rmi.RemoteException;
-import java.util.List;
+import java.util.Map;
 
-public interface ChatNode extends Remote {
-    // Basic chat operations
-    void receiveMessage(ChatMessage message) throws RemoteException;
-    
-    // Election algorithm operations
+public interface ChatNode extends java.rmi.Remote {
+    void receiveMessage(String sender, String message, int timestamp) throws RemoteException;
+    void pingNode() throws RemoteException;
+    void electCoordinator(int newCoordinatorId) throws RemoteException;
     void startElection() throws RemoteException;
-    void electionMessage(int senderID) throws RemoteException;
-    void coordinatorMessage(int coordinatorID) throws RemoteException;
-    
-    // Node management
-    int getNodeID() throws RemoteException;
-    boolean isAlive() throws RemoteException;
-    
-    // Get node status information
-    NodeInfo getNodeInfo() throws RemoteException;
+    void registerNode(int nodeId, String nodeName) throws RemoteException;
+    Map<Integer, String> getRegisteredNodes() throws RemoteException;
+    int getNodeId() throws RemoteException;
+    void start() throws RemoteException;
 }

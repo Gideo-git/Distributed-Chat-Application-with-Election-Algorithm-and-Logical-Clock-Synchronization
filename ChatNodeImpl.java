@@ -1,255 +1,330 @@
-import java.rmi.RemoteException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.registry.Registry;
 import java.rmi.server.UnicastRemoteObject;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.rmi.RemoteException;
+import java.rmi.NotBoundException;
+import java.util.*;
+import java.util.concurrent.*;
 
-public class ChatNodeImpl extends UnicastRemoteObject implements ChatNode {
-    private static final long serialVersionUID = 1L;
-    
-    private final int nodeID;
-    private final String nodeName;
-    private boolean isCoordinator;
-    private int coordinatorID;
-    private final AtomicInteger logicalClock;
-    private final List<ChatMessage> messageHistory;
-    private final ConcurrentHashMap<Integer, ChatNode> nodeRegistry;
-    private boolean electionInProgress;
-    private final List<String> systemLog;
-    
-    public ChatNodeImpl(int nodeID, String nodeName) throws RemoteException {
-        super();
-        this.nodeID = nodeID;
+public class ChatNodeImpl implements ChatNode {
+    private int nodeId;
+    private String nodeName;
+    private int logicalClock = 0;
+    private int coordinatorId;
+    private Map<Integer, String> registeredNodes = new ConcurrentHashMap<>();
+    private Map<Integer, ChatNode> nodeStubs = new ConcurrentHashMap<>();
+    private Registry registry;
+    private ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+    private int messageCounter = 0;
+
+    public ChatNodeImpl(int nodeId, String nodeName) throws RemoteException {
+        this.nodeId = nodeId;
         this.nodeName = nodeName;
-        this.isCoordinator = false;
-        this.coordinatorID = -1;
-        this.logicalClock = new AtomicInteger(0);
-        this.messageHistory = new CopyOnWriteArrayList<>();
-        this.nodeRegistry = new ConcurrentHashMap<>();
-        this.electionInProgress = false;
-        this.systemLog = new CopyOnWriteArrayList<>();
+        this.coordinatorId = nodeId; // Initially assume self as coordinator
+        this.registeredNodes.put(nodeId, nodeName);
         
-        logSystemEvent("Node initialized with ID " + nodeID + " and name " + nodeName);
+        System.out.println("[SYSTEM] Node initialized with ID " + nodeId + " and name " + nodeName);
     }
-    
+
     @Override
-    public void receiveMessage(ChatMessage message) throws RemoteException {
-        // Implement Lamport's logical clock algorithm
-        int receivedTimestamp = message.getLogicalTimestamp();
-        int newTimestamp = Math.max(logicalClock.get(), receivedTimestamp) + 1;
-        logicalClock.set(newTimestamp);
-        
-        message.setLogicalTimestamp(newTimestamp);
-        messageHistory.add(message);
-        
-        System.out.println(message);
-        
-        // If this node is the coordinator, broadcast the message to all nodes
-        if (isCoordinator) {
-            broadcastMessage(message);
+    public void start() throws RemoteException {
+        try {
+            // Try to create a new registry
+            try {
+                registry = LocateRegistry.createRegistry(1099);
+                System.out.println("Created new RMI registry on port 1099");
+            } catch (RemoteException e) {
+                // Registry already exists
+                registry = LocateRegistry.getRegistry(1099);
+                System.out.println("Using existing RMI registry on port 1099");
+            }
+
+            // Register this node
+            ChatNode stub = (ChatNode) UnicastRemoteObject.exportObject(this, 0);
+            registry.rebind("ChatNode_" + nodeId, stub);
+            System.out.println("Node registered as: ChatNode_" + nodeId);
+
+            // Discover existing nodes
+            discoverNodes();
+
+            // Start health check for coordinator
+            scheduler.scheduleAtFixedRate(this::checkCoordinator, 5, 5, TimeUnit.SECONDS);
+
+            // Start user input processing
+            startUserInputProcessing();
+
+        } catch (Exception e) {
+            System.err.println("Node startup error: " + e.getMessage());
+            e.printStackTrace();
         }
     }
-    
+
+    private void discoverNodes() {
+        try {
+            String[] nodes = registry.list();
+            for (String node : nodes) {
+                if (node.startsWith("ChatNode_") && !node.equals("ChatNode_" + nodeId)) {
+                    try {
+                        ChatNode remoteNode = (ChatNode) registry.lookup(node);
+                        int remoteId = remoteNode.getNodeId();
+                        
+                        if (remoteId != nodeId) {
+                            Map<Integer, String> remoteNodes = remoteNode.getRegisteredNodes();
+                            for (Map.Entry<Integer, String> entry : remoteNodes.entrySet()) {
+                                int id = entry.getKey();
+                                String name = entry.getValue();
+                                if (id != nodeId) {
+                                    registeredNodes.put(id, name);
+                                    System.out.println("[SYSTEM] Registered node with ID " + id + " (" + name + ")");
+                                    
+                                    // Get stub for this node for future communication
+                                    if (!nodeStubs.containsKey(id)) {
+                                        ChatNode stub = (ChatNode) registry.lookup("ChatNode_" + id);
+                                        nodeStubs.put(id, stub);
+                                    }
+                                }
+                            }
+                            
+                            // Register with the remote node
+                            remoteNode.registerNode(nodeId, nodeName);
+                        }
+                    } catch (Exception e) {
+                        System.err.println("Error connecting to node " + node + ": " + e.getMessage());
+                    }
+                }
+            }
+            
+            // Start election if other nodes were found
+            if (registeredNodes.size() > 1) {
+                startElection();
+            }
+        } catch (Exception e) {
+            System.err.println("Error discovering nodes: " + e.getMessage());
+        }
+    }
+
+    @Override
+    public void registerNode(int nodeId, String nodeName) throws RemoteException {
+        if (!registeredNodes.containsKey(nodeId)) {
+            registeredNodes.put(nodeId, nodeName);
+            System.out.println("[SYSTEM] Registered node with ID " + nodeId + " (" + nodeName + ")");
+            
+            // Get stub for this node for future communication
+            try {
+                ChatNode stub = (ChatNode) registry.lookup("ChatNode_" + nodeId);
+                nodeStubs.put(nodeId, stub);
+            } catch (NotBoundException e) {
+                System.err.println("Error getting stub for node " + nodeId + ": " + e.getMessage());
+            }
+        }
+    }
+
+    @Override
+    public Map<Integer, String> getRegisteredNodes() throws RemoteException {
+        return new HashMap<>(registeredNodes);
+    }
+
+    @Override
+    public int getNodeId() throws RemoteException {
+        return nodeId;
+    }
+
+    @Override
+    public void receiveMessage(String sender, String message, int timestamp) throws RemoteException {
+        // Update logical clock
+        logicalClock = Math.max(logicalClock, timestamp) + 1;
+        
+        // Print received message with logical timestamp
+        messageCounter++;
+        System.out.println("[" + messageCounter + "] " + sender + ": " + message);
+    }
+
+    @Override
+    public void pingNode() throws RemoteException {
+        // Simple method to check if node is alive
+    }
+
+    private void checkCoordinator() {
+        if (coordinatorId != nodeId) {
+            try {
+                ChatNode coordinator = nodeStubs.get(coordinatorId);
+                if (coordinator != null) {
+                    coordinator.pingNode();
+                } else {
+                    // Try to get the coordinator stub
+                    try {
+                        ChatNode stub = (ChatNode) registry.lookup("ChatNode_" + coordinatorId);
+                        nodeStubs.put(coordinatorId, stub);
+                        stub.pingNode();
+                    } catch (Exception e) {
+                        System.out.println("[SYSTEM] Coordinator not responding, starting election");
+                        try {
+                            startElection();
+                        } catch (RemoteException re) {
+                            System.err.println("Error starting election: " + re.getMessage());
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                System.out.println("[SYSTEM] Coordinator not responding, starting election");
+                try {
+                    startElection();
+                } catch (RemoteException re) {
+                    System.err.println("Error starting election: " + re.getMessage());
+                }
+            }
+        }
+    }
+
     @Override
     public void startElection() throws RemoteException {
-        if (electionInProgress) {
-            return;
-        }
+        System.out.println("[SYSTEM] Starting election process");
         
-        electionInProgress = true;
-        logSystemEvent("Starting election process");
+        boolean higherNodeExists = false;
         
-        // Find nodes with higher IDs
-        List<Integer> higherNodes = new ArrayList<>();
-        for (Integer id : nodeRegistry.keySet()) {
-            if (id > nodeID) {
-                higherNodes.add(id);
-            }
-        }
-        
-        if (higherNodes.isEmpty()) {
-            // This node has the highest ID, so it becomes the coordinator
-            becomeCoordinator();
-            return;
-        }
-        
-        // Send election messages to higher-ID nodes
-        boolean responseReceived = false;
-        for (Integer higherID : higherNodes) {
-            try {
-                ChatNode node = nodeRegistry.get(higherID);
-                if (node != null && node.isAlive()) {
-                    node.electionMessage(nodeID);
-                    responseReceived = true;
-                }
-            } catch (RemoteException e) {
-                // Node is likely down, remove it from registry
-                nodeRegistry.remove(higherID);
-            }
-        }
-        
-        if (!responseReceived) {
-            // No higher nodes responded, become coordinator
-            becomeCoordinator();
-        }
-    }
-    
-    @Override
-    public void electionMessage(int senderID) throws RemoteException {
-        logSystemEvent("Received election message from node " + senderID);
-        
-        // Reply to the sender to indicate that a node with higher ID exists
-        try {
-            ChatNode sender = nodeRegistry.get(senderID);
-            if (sender != null && sender.isAlive()) {
-                // This sends an "OK" message implicitly
-                logSystemEvent("Sending OK message to node " + senderID);
-            }
-        } catch (RemoteException e) {
-            nodeRegistry.remove(senderID);
-        }
-        
-        // Start a new election
-        if (!electionInProgress) {
-            startElection();
-        }
-    }
-    
-    @Override
-    public void coordinatorMessage(int coordinatorID) throws RemoteException {
-        this.coordinatorID = coordinatorID;
-        this.isCoordinator = (nodeID == coordinatorID);
-        this.electionInProgress = false;
-        
-        logSystemEvent("Coordinator set to node " + coordinatorID);
-    }
-    
-    private void becomeCoordinator() {
-        isCoordinator = true;
-        coordinatorID = nodeID;
-        electionInProgress = false;
-        
-        logSystemEvent("This node is now the coordinator");
-        
-        // Inform all other nodes about the new coordinator
-        for (Integer id : nodeRegistry.keySet()) {
-            if (id != nodeID) {
+        // Check if there are nodes with higher IDs
+        for (int id : registeredNodes.keySet()) {
+            if (id > nodeId) {
+                higherNodeExists = true;
                 try {
-                    ChatNode node = nodeRegistry.get(id);
-                    if (node != null && node.isAlive()) {
-                        node.coordinatorMessage(nodeID);
+                    ChatNode node = nodeStubs.get(id);
+                    if (node == null) {
+                        // Try to get the node stub
+                        try {
+                            node = (ChatNode) registry.lookup("ChatNode_" + id);
+                            nodeStubs.put(id, node);
+                        } catch (Exception e) {
+                            System.err.println("Error connecting to node " + id + ": " + e.getMessage());
+                            continue;
+                        }
                     }
-                } catch (RemoteException e) {
-                    nodeRegistry.remove(id);
+                    
+                    // Send election message to higher node
+                    node.startElection();
+                } catch (Exception e) {
+                    // Node might be down, remove it
+                    System.err.println("Error connecting to node " + id + ": " + e.getMessage());
+                    nodeStubs.remove(id);
+                    registeredNodes.remove(id);
+                }
+            }
+        }
+        
+        // If no higher node exists or responds, this node becomes coordinator
+        if (!higherNodeExists) {
+            becomeCoordinator();
+        }
+    }
+
+    private void becomeCoordinator() {
+        System.out.println("[SYSTEM] This node is now the coordinator");
+        coordinatorId = nodeId;
+        
+        // Notify all other nodes about the new coordinator
+        for (int id : registeredNodes.keySet()) {
+            if (id != nodeId) {
+                try {
+                    ChatNode node = nodeStubs.get(id);
+                    if (node == null) {
+                        try {
+                            node = (ChatNode) registry.lookup("ChatNode_" + id);
+                            nodeStubs.put(id, node);
+                        } catch (Exception e) {
+                            System.err.println("Error connecting to node " + id + ": " + e.getMessage());
+                            continue;
+                        }
+                    }
+                    node.electCoordinator(nodeId);
+                } catch (Exception e) {
+                    // Node might be down, remove it
+                    System.err.println("Error notifying node " + id + " about new coordinator: " + e.getMessage());
+                    nodeStubs.remove(id);
+                    registeredNodes.remove(id);
                 }
             }
         }
     }
-    
-    public void broadcastMessage(ChatMessage message) {
-        for (Integer id : nodeRegistry.keySet()) {
-            try {
-                ChatNode node = nodeRegistry.get(id);
-                if (node != null && id != message.getSenderID() && node.isAlive()) {
-                    node.receiveMessage(message);
+
+    @Override
+    public void electCoordinator(int newCoordinatorId) throws RemoteException {
+        this.coordinatorId = newCoordinatorId;
+        System.out.println("[SYSTEM] Coordinator set to node " + newCoordinatorId);
+    }
+
+    private void startUserInputProcessing() {
+        System.out.println("Chat node started. Type 'help' for commands.");
+        
+        Scanner scanner = new Scanner(System.in);
+        while (true) {
+            String input = scanner.nextLine();
+            
+            if (input.equalsIgnoreCase("exit")) {
+                System.out.println("Exiting chat system...");
+                System.exit(0);
+            } else if (input.equalsIgnoreCase("help")) {
+                System.out.println("Available commands:");
+                System.out.println("  help - Display this help message");
+                System.out.println("  exit - Exit the chat system");
+                System.out.println("  nodes - List all registered nodes");
+                System.out.println("  election - Start a new coordinator election");
+                System.out.println("  Any other text will be sent as a chat message");
+            } else if (input.equalsIgnoreCase("nodes")) {
+                System.out.println("Registered nodes:");
+                for (Map.Entry<Integer, String> entry : registeredNodes.entrySet()) {
+                    System.out.println("  Node " + entry.getKey() + " (" + entry.getValue() + ")" + 
+                                      (entry.getKey() == coordinatorId ? " (coordinator)" : ""));
                 }
-            } catch (RemoteException e) {
-                nodeRegistry.remove(id);
+            } else if (input.equalsIgnoreCase("election")) {
+                try {
+                    startElection();
+                } catch (Exception e) {
+                    System.err.println("Error starting election: " + e.getMessage());
+                }
+            } else {
+                // Increment logical clock for new message
+                logicalClock++;
                 
-                // If the coordinator fails, start a new election
-                if (id == coordinatorID) {
+                // Process as chat message
+                broadcastMessage(input, logicalClock);
+            }
+        }
+    }
+
+    private void broadcastMessage(String message, int timestamp) {
+        // Send message to all nodes including self to maintain message ordering
+        for (int id : registeredNodes.keySet()) {
+            try {
+                ChatNode node = id == nodeId ? this : nodeStubs.get(id);
+                
+                if (node == null && id != nodeId) {
+                    // Try to get the node stub
+                    try {
+                        node = (ChatNode) registry.lookup("ChatNode_" + id);
+                        nodeStubs.put(id, node);
+                    } catch (Exception e) {
+                        System.err.println("Error connecting to node " + id + ": " + e.getMessage());
+                        continue;
+                    }
+                }
+                
+                node.receiveMessage(nodeName, message, timestamp);
+            } catch (Exception e) {
+                System.err.println("Error sending message to node " + id + ": " + e.getMessage());
+                
+                // If the error is with the coordinator, start an election
+                if (id == coordinatorId && id != nodeId) {
+                    System.out.println("[SYSTEM] Coordinator not responding, starting election");
                     try {
                         startElection();
                     } catch (RemoteException ex) {
-                        logSystemEvent("Error starting election: " + ex.getMessage());
+                        System.err.println("Error starting election: " + ex.getMessage());
                     }
                 }
-            }
-        }
-    }
-    
-    public void registerNode(int id, ChatNode node) {
-        nodeRegistry.put(id, node);
-        logSystemEvent("Registered node with ID " + id);
-        
-        // If there's no coordinator yet, start an election
-        if (coordinatorID == -1 && !electionInProgress) {
-            try {
-                startElection();
-            } catch (RemoteException e) {
-                logSystemEvent("Error starting election: " + e.getMessage());
-            }
-        }
-    }
-    
-    public void sendMessage(String content) {
-        int timestamp = logicalClock.incrementAndGet();
-        ChatMessage message = new ChatMessage(content, nodeName, nodeID, timestamp);
-        
-        try {
-            // If there's a coordinator, send the message to it
-            if (coordinatorID != -1 && coordinatorID != nodeID) {
-                ChatNode coordinator = nodeRegistry.get(coordinatorID);
-                if (coordinator != null && coordinator.isAlive()) {
-                    coordinator.receiveMessage(message);
-                } else {
-                    // Coordinator is down, start a new election
-                    startElection();
-                }
-            } else if (isCoordinator) {
-                // This node is the coordinator, handle the message directly
-                receiveMessage(message);
-            } else {
-                logSystemEvent("Cannot send message: No coordinator available");
                 
-                // Start an election if no coordinator exists
-                if (!electionInProgress) {
-                    startElection();
-                }
-            }
-        } catch (RemoteException e) {
-            logSystemEvent("Error sending message: " + e.getMessage());
-            
-            try {
-                // Coordinator might be down, start a new election
-                startElection();
-            } catch (RemoteException ex) {
-                logSystemEvent("Error starting election: " + ex.getMessage());
+                // Remove failed node
+                nodeStubs.remove(id);
+                registeredNodes.remove(id);
             }
         }
-    }
-    
-    @Override
-    public int getNodeID() throws RemoteException {
-        return nodeID;
-    }
-    
-    @Override
-    public boolean isAlive() throws RemoteException {
-        return true;
-    }
-    
-    @Override
-    public NodeInfo getNodeInfo() throws RemoteException {
-        return new NodeInfo(nodeID, nodeName, isCoordinator, logicalClock.get());
-    }
-    
-    private void logSystemEvent(String event) {
-        String logEntry = "[SYSTEM] " + event;
-        systemLog.add(logEntry);
-        System.out.println(logEntry);
-    }
-    
-    public List<String> getSystemLog() {
-        return Collections.unmodifiableList(systemLog);
-    }
-    
-    public List<ChatMessage> getMessageHistory() {
-        return Collections.unmodifiableList(messageHistory);
     }
 }
